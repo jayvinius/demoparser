@@ -2,6 +2,13 @@ use std::{io::Result, process::Command};
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=GameTracking-CS2/Protobufs/demo.proto");
+    println!("cargo::rerun-if-env-changed=CSGOPROTO_REGENERATE");
+
+    // src/protobuf.rs is committed and carries hand edits; regenerating it from the newest
+    // upstream protos on every build is neither reproducible nor safe. Opt in explicitly.
+    if std::env::var_os("CSGOPROTO_REGENERATE").is_none() && std::path::Path::new("src/protobuf.rs").exists() {
+        return Ok(());
+    }
 
     Command::new("git")
         .args([
