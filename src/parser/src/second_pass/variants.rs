@@ -42,6 +42,14 @@ pub struct InputHistory {
     pub render_tick_fraction: f32,
     pub player_tick_count: i32,
     pub player_tick_fraction: f32,
+    pub frame_number: i32,
+    /// Entity the client saw under its crosshair when sampling this input, -1 for none.
+    pub target_ent_index: i32,
+    /// Client-side shot origin and target checks, present on entries the client attached them to.
+    pub shoot_position: Option<[f32; 3]>,
+    pub target_head_pos_check: Option<[f32; 3]>,
+    pub target_abs_pos_check: Option<[f32; 3]>,
+    pub target_abs_ang_check: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

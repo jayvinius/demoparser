@@ -852,6 +852,12 @@ impl DemoParser {
                                     "player_tick_fraction",
                                     sticker.player_tick_fraction,
                                 )?;
+                                dict.set_item("frame_number", sticker.frame_number)?;
+                                dict.set_item("target_ent_index", sticker.target_ent_index)?;
+                                dict.set_item("shoot_position", sticker.shoot_position)?;
+                                dict.set_item("target_head_pos_check", sticker.target_head_pos_check)?;
+                                dict.set_item("target_abs_pos_check", sticker.target_abs_pos_check)?;
+                                dict.set_item("target_abs_ang_check", sticker.target_abs_ang_check)?;
                                 v.push(dict);
                             }
                             dicts.push(v);

@@ -388,6 +388,7 @@ impl<'a> SecondPassParser<'a> {
             .iter()
             .map(|input| {
                 let view_angles = input.view_angles.clone().unwrap_or_default();
+                let vec3 = |v: &Option<csgoproto::CMsgVector>| v.as_ref().map(|v| [v.x(), v.y(), v.z()]);
                 InputHistory {
                     player_tick_count: input.player_tick_count(),
                     player_tick_fraction: input.player_tick_fraction(),
@@ -396,10 +397,25 @@ impl<'a> SecondPassParser<'a> {
                     x: view_angles.x(),
                     y: view_angles.y(),
                     z: view_angles.z(),
+                    frame_number: input.frame_number(),
+                    target_ent_index: input.target_ent_index(),
+                    shoot_position: vec3(&input.shoot_position),
+                    target_head_pos_check: vec3(&input.target_head_pos_check),
+                    target_abs_pos_check: vec3(&input.target_abs_pos_check),
+                    target_abs_ang_check: input.target_abs_ang_check.as_ref().map(|a| [a.x(), a.y(), a.z()]),
                 }
             })
             .collect();
         ent.props.insert(USERCMD_INPUT_HISTORY_BASEID, Variant::InputHistory(history));
+        // Index into input_history of the sample where attack/attack2 started this command, -1 if none.
+        ent.props.insert(
+            USERCMD_ATTACK_START_HISTORY_INDEX_1,
+            Variant::I32(user_cmd.attack1_start_history_index()),
+        );
+        ent.props.insert(
+            USERCMD_ATTACK_START_HISTORY_INDEX_2,
+            Variant::I32(user_cmd.attack2_start_history_index()),
+        );
         let subtick_moves = base
             .subtick_moves
             .iter()
