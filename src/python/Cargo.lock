@@ -299,12 +299,11 @@ dependencies = [
 
 [[package]]
 name = "demoparser2"
-version = "0.42.0"
+version = "0.42.0+pugstar.1"
 dependencies = [
  "ahash",
  "csgoproto",
  "derive_more",
- "ethnum",
  "itertools 0.13.0",
  "memmap2 0.9.9",
  "parser",
