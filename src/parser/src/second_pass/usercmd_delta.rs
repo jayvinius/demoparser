@@ -12,6 +12,31 @@ use csgoproto::CInButtonStatePb;
 use csgoproto::CMsgQAngle;
 use csgoproto::CsgoUserCmdPb;
 use prost::Message;
+use std::fmt;
+
+/// Why a delta could not be applied. The caller keeps the previous baseline either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeltaError {
+    /// Truncated varint or length, zero field number, or an invalid wire type.
+    Malformed(&'static str),
+    /// A wire-type-7 reset names a field this decoder has no schema for.
+    UnknownResetField { schema: &'static str, field: u64 },
+    /// The repeated-field operation stream broke the expected grammar.
+    Repeated { schema: &'static str, reason: &'static str },
+    /// prost rejected the sanitized bytes.
+    Decode(&'static str),
+}
+
+impl fmt::Display for DeltaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(what) => write!(f, "malformed: {what}"),
+            Self::UnknownResetField { schema, field } => write!(f, "reset of unknown field {schema}.{field}"),
+            Self::Repeated { schema, reason } => write!(f, "repeated {schema}: {reason}"),
+            Self::Decode(what) => write!(f, "decode failed: {what}"),
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct DeltaBaseUserCmdPb {
@@ -102,11 +127,28 @@ enum MessageSchema {
     BaseUserCmd,
     Buttons,
     QAngle,
+    Vector,
+    Interp,
+    InterpCl,
     InputHistory,
     SubtickMove,
 }
 
 impl MessageSchema {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CsgoUserCmd => "CSGOUserCmdPB",
+            Self::BaseUserCmd => "CBaseUserCmdPB",
+            Self::Buttons => "CInButtonStatePB",
+            Self::QAngle => "CMsgQAngle",
+            Self::Vector => "CMsgVector",
+            Self::Interp => "CSGOInterpolationInfoPB",
+            Self::InterpCl => "CSGOInterpolationInfoPB_CL",
+            Self::InputHistory => "CSGOInputHistoryEntryPB",
+            Self::SubtickMove => "CSubtickMoveStep",
+        }
+    }
+
     fn field_wire_type(self, field: u64) -> Option<u8> {
         match self {
             Self::CsgoUserCmd => match field {
@@ -126,6 +168,19 @@ impl MessageSchema {
             },
             Self::QAngle => match field {
                 1..=3 => Some(5),
+                _ => None,
+            },
+            Self::Vector => match field {
+                1..=4 => Some(5),
+                _ => None,
+            },
+            Self::Interp => match field {
+                1 | 2 => Some(0),
+                3 => Some(5),
+                _ => None,
+            },
+            Self::InterpCl => match field {
+                3 => Some(5),
                 _ => None,
             },
             Self::InputHistory => match field {
@@ -148,6 +203,9 @@ impl MessageSchema {
             (Self::BaseUserCmd, 3) => Some(Self::Buttons),
             (Self::BaseUserCmd, 4) => Some(Self::QAngle),
             (Self::InputHistory, 2 | 69) => Some(Self::QAngle),
+            (Self::InputHistory, 12) => Some(Self::InterpCl),
+            (Self::InputHistory, 13..=15) => Some(Self::Interp),
+            (Self::InputHistory, 66..=68) => Some(Self::Vector),
             _ => None,
         }
     }
@@ -178,6 +236,9 @@ impl MessageSchema {
             ],
             Self::Buttons => &[(1, 0), (2, 0), (3, 0)],
             Self::QAngle => &[(1, 5), (2, 5), (3, 5)],
+            Self::Vector => &[(1, 5), (2, 5), (3, 5), (4, 5)],
+            Self::Interp => &[(1, 0), (2, 0), (3, 5)],
+            Self::InterpCl => &[(3, 5)],
             Self::InputHistory => &[(2, 2), (4, 0), (5, 5), (6, 0), (7, 5), (64, 0), (65, 0)],
             Self::SubtickMove => &[(1, 0), (2, 0), (3, 5), (4, 5), (5, 5), (8, 5), (9, 5)],
         }
@@ -187,7 +248,7 @@ impl MessageSchema {
         match wire_type {
             0 => {
                 let value = match (self, field) {
-                    (Self::CsgoUserCmd, 6 | 7) | (Self::InputHistory, 65) => u64::MAX,
+                    (Self::CsgoUserCmd, 6 | 7) | (Self::InputHistory, 65) | (Self::Interp, 1 | 2) => u64::MAX,
                     (Self::BaseUserCmd, 14) => 0x00ff_ffff,
                     _ => 0,
                 };
@@ -218,39 +279,99 @@ impl MessageSchema {
     }
 }
 
-fn sanitize_message(mut bytes: &[u8], schema: MessageSchema) -> Option<Vec<u8>> {
+const TRUNCATED: DeltaError = DeltaError::Malformed("truncated");
+
+/// Elements of repeated fields record which of their own fields a delta reset, so they can be
+/// cleared to `None` after the merge. Writing the default alone is not enough for message
+/// fields: merging an empty or default sub-message leaves the old value in place.
+trait ClearField {
+    fn clear_field(&mut self, field: u64);
+}
+
+impl ClearField for csgoproto::CsgoInputHistoryEntryPb {
+    fn clear_field(&mut self, field: u64) {
+        match field {
+            2 => self.view_angles = None,
+            4 => self.render_tick_count = None,
+            5 => self.render_tick_fraction = None,
+            6 => self.player_tick_count = None,
+            7 => self.player_tick_fraction = None,
+            12 => self.cl_interp = None,
+            13 => self.sv_interp0 = None,
+            14 => self.sv_interp1 = None,
+            15 => self.player_interp = None,
+            64 => self.frame_number = None,
+            65 => self.target_ent_index = None,
+            66 => self.shoot_position = None,
+            67 => self.target_head_pos_check = None,
+            68 => self.target_abs_pos_check = None,
+            69 => self.target_abs_ang_check = None,
+            _ => {}
+        }
+    }
+}
+
+impl ClearField for csgoproto::CSubtickMoveStep {
+    fn clear_field(&mut self, field: u64) {
+        match field {
+            1 => self.button = None,
+            2 => self.pressed = None,
+            3 => self.when = None,
+            4 => self.analog_forward_delta = None,
+            5 => self.analog_left_delta = None,
+            8 => self.pitch_delta = None,
+            9 => self.yaw_delta = None,
+            _ => {}
+        }
+    }
+}
+
+/// Rewrites a delta message into standard protobuf: wire-type-7 resets become explicit default
+/// values. Field numbers reset at this level (not in nested messages) are pushed to `resets`.
+fn sanitize_message(
+    mut bytes: &[u8],
+    schema: MessageSchema,
+    mut resets: Option<&mut Vec<u64>>,
+) -> Result<Vec<u8>, DeltaError> {
     let mut out = Vec::with_capacity(bytes.len());
     while !bytes.is_empty() {
-        let key = read_varint(&mut bytes)?;
+        let key = read_varint(&mut bytes).ok_or(TRUNCATED)?;
         let field = key >> 3;
         let wire_type = (key & 0x07) as u8;
         if field == 0 {
-            return None;
+            return Err(DeltaError::Malformed("field number 0"));
         }
 
         if wire_type == 7 {
-            let normal_wire_type = schema.field_wire_type(field)?;
+            if let Some(resets) = resets.as_deref_mut() {
+                resets.push(field);
+            }
+            let normal_wire_type = schema
+                .field_wire_type(field)
+                .ok_or(DeltaError::UnknownResetField { schema: schema.name(), field })?;
             write_varint((field << 3) | u64::from(normal_wire_type), &mut out);
-            schema.write_default(field, normal_wire_type, &mut out)?;
+            schema
+                .write_default(field, normal_wire_type, &mut out)
+                .ok_or(DeltaError::Malformed("no default for reset field"))?;
             continue;
         }
 
         write_varint(key, &mut out);
         match wire_type {
             0 => {
-                let value = read_varint(&mut bytes)?;
+                let value = read_varint(&mut bytes).ok_or(TRUNCATED)?;
                 write_varint(value, &mut out);
             }
             1 => {
-                let (value, rest) = bytes.split_at_checked(8)?;
+                let (value, rest) = bytes.split_at_checked(8).ok_or(TRUNCATED)?;
                 out.extend_from_slice(value);
                 bytes = rest;
             }
             2 => {
-                let length = usize::try_from(read_varint(&mut bytes)?).ok()?;
-                let (value, rest) = bytes.split_at_checked(length)?;
+                let length = usize::try_from(read_varint(&mut bytes).ok_or(TRUNCATED)?).map_err(|_| TRUNCATED)?;
+                let (value, rest) = bytes.split_at_checked(length).ok_or(TRUNCATED)?;
                 let value = if let Some(child) = schema.child(field) {
-                    sanitize_message(value, child)?
+                    sanitize_message(value, child, None)?
                 } else {
                     value.to_vec()
                 };
@@ -259,54 +380,65 @@ fn sanitize_message(mut bytes: &[u8], schema: MessageSchema) -> Option<Vec<u8>> 
                 bytes = rest;
             }
             5 => {
-                let (value, rest) = bytes.split_at_checked(4)?;
+                let (value, rest) = bytes.split_at_checked(4).ok_or(TRUNCATED)?;
                 out.extend_from_slice(value);
                 bytes = rest;
             }
-            _ => return None,
+            _ => return Err(DeltaError::Malformed("invalid wire type")),
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Reconstructs the codegen-delta list from its per-player-slot baseline.
 /// The leading wire-type 7 key declares the target length; following field
 /// numbers are zero-based element indices and may be sparse.
-fn decode_repeated<M>(payloads: &[prost::bytes::Bytes], schema: MessageSchema, previous: &[M]) -> Option<Vec<M>>
+fn decode_repeated<M>(
+    payloads: &[prost::bytes::Bytes],
+    schema: MessageSchema,
+    previous: &[M],
+) -> Result<Vec<M>, DeltaError>
 where
-    M: Message + Default + Clone,
+    M: Message + Default + Clone + ClearField,
 {
+    let fail = |reason| DeltaError::Repeated { schema: schema.name(), reason };
+    let mut resets = Vec::new();
     let mut messages = previous.to_vec();
     let mut declared_count = None;
     for payload in payloads {
         let mut bytes = payload.as_ref();
         if !bytes.is_empty() {
             let mut after_marker = bytes;
-            let marker = read_varint(&mut after_marker)?;
+            let marker = read_varint(&mut after_marker).ok_or(TRUNCATED)?;
             if marker & 0x07 == 7 {
                 if declared_count.is_some() {
-                    return None;
+                    return Err(fail("second length marker"));
                 }
-                let count = usize::try_from(marker >> 3).ok()?;
+                let count = usize::try_from(marker >> 3).map_err(|_| TRUNCATED)?;
                 messages.resize(count, M::default());
                 declared_count = Some(count);
                 bytes = after_marker;
             }
         }
         while !bytes.is_empty() {
-            let key = read_varint(&mut bytes)?;
+            let key = read_varint(&mut bytes).ok_or(TRUNCATED)?;
             if key & 0x07 != 2 {
-                return None;
+                return Err(fail("element op is not length-delimited"));
             }
-            let index = usize::try_from(key >> 3).ok()?;
-            let length = usize::try_from(read_varint(&mut bytes)?).ok()?;
-            let (message, rest) = bytes.split_at_checked(length)?;
-            let message = sanitize_message(message, schema)?;
-            messages.get_mut(index)?.merge(message.as_slice()).ok()?;
+            let index = usize::try_from(key >> 3).map_err(|_| TRUNCATED)?;
+            let length = usize::try_from(read_varint(&mut bytes).ok_or(TRUNCATED)?).map_err(|_| TRUNCATED)?;
+            let (message, rest) = bytes.split_at_checked(length).ok_or(TRUNCATED)?;
+            resets.clear();
+            let message = sanitize_message(message, schema, Some(&mut resets))?;
+            let element = messages.get_mut(index).ok_or(fail("index out of bounds"))?;
+            element.merge(message.as_slice()).map_err(|_| DeltaError::Decode(schema.name()))?;
+            for &field in &resets {
+                element.clear_field(field);
+            }
             bytes = rest;
         }
     }
-    Some(messages)
+    Ok(messages)
 }
 
 fn replace_if_some<T>(target: &mut Option<T>, value: Option<T>) {
@@ -329,9 +461,9 @@ fn merge_qangle(target: &mut Option<CMsgQAngle>, delta: CMsgQAngle) {
     replace_if_some(&mut target.z, delta.z);
 }
 
-pub(super) fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Option<CsgoUserCmdPb> {
-    let sanitized = sanitize_message(delta_data, MessageSchema::CsgoUserCmd)?;
-    let delta = DeltaCsgoUserCmdPb::decode(sanitized.as_slice()).ok()?;
+pub(super) fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Result<CsgoUserCmdPb, DeltaError> {
+    let sanitized = sanitize_message(delta_data, MessageSchema::CsgoUserCmd, None)?;
+    let delta = DeltaCsgoUserCmdPb::decode(sanitized.as_slice()).map_err(|_| DeltaError::Decode("CSGOUserCmdPB"))?;
     let mut next = baseline.clone();
 
     if !delta.input_history_delta.is_empty() {
@@ -368,14 +500,15 @@ pub(super) fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Option
         replace_if_some(&mut base.consumed_server_angle_changes, delta_base.consumed_server_angle_changes);
         replace_if_some(&mut base.cmd_flags, delta_base.cmd_flags);
         if let Some(notes) = delta_base.execution_notes {
-            base.execution_notes = Some(CBaseUserCmdExecutionNotes::decode(notes).ok()?);
+            base.execution_notes =
+                Some(CBaseUserCmdExecutionNotes::decode(notes).map_err(|_| DeltaError::Decode("ExecutionNotes"))?);
         }
         if !delta_base.subtick_moves_delta.is_empty() {
             base.subtick_moves = decode_repeated(&delta_base.subtick_moves_delta, MessageSchema::SubtickMove, &base.subtick_moves)?;
         }
     }
 
-    Some(next)
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -468,6 +601,78 @@ mod tests {
         assert_eq!(buttons.buttonstate1, Some(1));
         assert_eq!(buttons.buttonstate2, Some(0));
         assert_eq!(buttons.buttonstate3, Some(3));
+    }
+
+    /// Wraps one input-history element op (index 0) in a top-level CSGOUserCmdPB delta.
+    fn history_delta(element: &[u8]) -> Vec<u8> {
+        let mut op = vec![0x02, element.len() as u8];
+        op.extend_from_slice(element);
+        let mut out = vec![0x12, op.len() as u8];
+        out.extend_from_slice(&op);
+        out
+    }
+
+    fn vector(x: f32, y: f32, z: f32) -> csgoproto::CMsgVector {
+        csgoproto::CMsgVector {
+            x: Some(x),
+            y: Some(y),
+            z: Some(z),
+            w: None,
+        }
+    }
+
+    #[test]
+    fn reset_clears_message_field_in_history_element() {
+        let mut baseline = CsgoUserCmdPb::default();
+        baseline.input_history = vec![csgoproto::CsgoInputHistoryEntryPb {
+            view_angles: Some(CMsgQAngle {
+                x: Some(5.0),
+                y: Some(6.0),
+                z: None,
+            }),
+            target_head_pos_check: Some(vector(1.0, 2.0, 3.0)),
+            ..Default::default()
+        }];
+        // Field 67 (target_head_pos_check) with wire type 7.
+        let command = apply_delta(&baseline, &history_delta(&[0x9f, 0x04])).unwrap();
+        let entry = &command.input_history[0];
+        assert_eq!(entry.target_head_pos_check, None);
+        assert_eq!(entry.view_angles.as_ref().unwrap().y, Some(6.0));
+    }
+
+    #[test]
+    fn nested_reset_inside_vector_keeps_other_components() {
+        let mut baseline = CsgoUserCmdPb::default();
+        baseline.input_history = vec![csgoproto::CsgoInputHistoryEntryPb {
+            shoot_position: Some(vector(1.0, 2.0, 3.0)),
+            ..Default::default()
+        }];
+        // Field 66 (shoot_position): reset x, set y = 2.5. Used to fail the whole command.
+        let element = [0x92, 0x04, 0x06, 0x0f, 0x15, 0x00, 0x00, 0x20, 0x40];
+        let command = apply_delta(&baseline, &history_delta(&element)).unwrap();
+        let shoot = command.input_history[0].shoot_position.as_ref().unwrap();
+        assert_eq!(shoot.x(), 0.0);
+        assert_eq!(shoot.y, Some(2.5));
+        assert_eq!(shoot.z, Some(3.0));
+    }
+
+    #[test]
+    fn interp_reset_uses_minus_one_default() {
+        let mut baseline = CsgoUserCmdPb::default();
+        baseline.input_history = vec![csgoproto::CsgoInputHistoryEntryPb {
+            sv_interp0: Some(csgoproto::CsgoInterpolationInfoPb {
+                src_tick: Some(5),
+                dst_tick: Some(6),
+                frac: Some(0.5),
+            }),
+            ..Default::default()
+        }];
+        // Field 13 (sv_interp0): reset src_tick.
+        let command = apply_delta(&baseline, &history_delta(&[0x6a, 0x01, 0x0f])).unwrap();
+        let interp = command.input_history[0].sv_interp0.as_ref().unwrap();
+        assert_eq!(interp.src_tick, Some(-1));
+        assert_eq!(interp.dst_tick, Some(6));
+        assert_eq!(interp.frac, Some(0.5));
     }
 
     #[test]

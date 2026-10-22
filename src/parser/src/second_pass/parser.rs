@@ -32,6 +32,7 @@ use snap::raw::decompress_len;
 use snap::raw::Decoder as SnapDecoder;
 
 use super::variants::{InputHistory, UserCmdSubtickMove};
+use super::usercmd_audit::{self, Counter};
 use super::usercmd_delta::apply_delta;
 
 const OUTER_BUF_DEFAULT_LEN: usize = 400_000;
@@ -305,25 +306,68 @@ impl<'a> SecondPassParser<'a> {
             if player_slot < 0 {
                 continue;
             }
+            usercmd_audit::bump(Counter::Commands);
+            if let Some(number) = cmd.cmd_number {
+                if let Some(&last) = self.usercmd_numbers.get(&player_slot) {
+                    if number == last {
+                        usercmd_audit::bump(Counter::NumberDuplicate);
+                    } else if number < last {
+                        usercmd_audit::bump(Counter::NumberRegressed);
+                    } else if number > last + 1 {
+                        usercmd_audit::bump(Counter::NumberGap);
+                    }
+                }
+                self.usercmd_numbers.insert(player_slot, number);
+            }
             let data = cmd.data.as_ref().filter(|data| !data.is_empty());
             let delta_data = cmd.delta_data.as_ref().filter(|data| !data.is_empty());
             let mut next = if let Some(data) = data {
+                usercmd_audit::bump(Counter::Full);
                 match CsgoUserCmdPb::decode(data.as_ref()) {
                     Ok(command) => Some(command),
                     Err(_) => continue,
                 }
             } else if delta_data.is_some() {
-                self.usercmd_baselines.get(&player_slot).cloned()
+                usercmd_audit::bump(Counter::Delta);
+                let baseline = self.usercmd_baselines.get(&player_slot).cloned();
+                if baseline.is_none() {
+                    usercmd_audit::bump(Counter::DeltaNoBaseline);
+                }
+                baseline
             } else {
                 continue;
             };
 
             if let Some(delta_data) = delta_data {
-                next = next.as_ref().and_then(|baseline| apply_delta(baseline, delta_data.as_ref()));
+                next = match next.as_ref().map(|baseline| apply_delta(baseline, delta_data.as_ref())) {
+                    Some(Ok(command)) => {
+                        usercmd_audit::bump(Counter::DeltaOk);
+                        Some(command)
+                    }
+                    Some(Err(e)) => {
+                        usercmd_audit::record_failure(e.to_string());
+                        None
+                    }
+                    None => None,
+                };
             }
             let Some(next) = next else {
                 continue;
             };
+            usercmd_audit::add(Counter::HistoryEntries, next.input_history.len() as u64);
+            for entry in &next.input_history {
+                match entry.view_angles.as_ref() {
+                    None => usercmd_audit::bump(Counter::HistoryNoAngles),
+                    Some(a) => {
+                        if a.x.is_none() {
+                            usercmd_audit::bump(Counter::HistoryNoPitch);
+                        }
+                        if a.y.is_none() {
+                            usercmd_audit::bump(Counter::HistoryNoYaw);
+                        }
+                    }
+                }
+            }
             self.usercmd_baselines.insert(player_slot, next.clone());
             self.apply_user_cmd(&next);
         }
