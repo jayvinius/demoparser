@@ -1,7 +1,8 @@
 # PugStar fork notes
 
-Local branch `pugstar/subtick`, based on upstream `main` at 45ca85a (after v0.42.01).
-Not pushed anywhere. PugStar builds the Python package from this tree.
+Branch `pugstar/subtick` of https://github.com/jayvinius/demoparser, a fork of
+LaihoE/demoparser, based on upstream `main` at 45ca85a (after v0.42.01). PugStar's analyzer
+installs the Python package from a tag on this branch.
 
 ## Why not PyPI 0.42.0
 
@@ -45,10 +46,16 @@ plausibility check 97 to 98% of the time, matching pre-July demos.
 cd src/parser
 cargo test --release --lib
 cargo run --release --bin usercmd_audit -- path/to/demo.dem
-
-# Python package into PugStar's environment (PugStar's pyproject points here)
-cd <pugstar>/services/analyzer && uv sync
 ```
 
-After changing Rust code, bump the local version in `src/python/Cargo.toml`
-(`0.42.0+pugstar.N`) so uv rebuilds instead of reusing its cached wheel.
+PugStar's `services/analyzer/pyproject.toml` takes `demoparser2` from a tag here, which uv
+builds with cargo. To release a change:
+
+1. Bump the local version in `src/python/Cargo.toml` (`0.42.0+pugstar.N`).
+2. Commit, tag `v0.42.0-pugstar.N`, and push the branch and the tag to `origin`.
+3. In PugStar, set the analyzer's `demoparser2` source to the new tag, then run `uv lock` and
+   `uv sync` in `services/analyzer`.
+
+To try a change before tagging it, run `uv pip install <this repo>/src/python` in
+`services/analyzer`. `uv sync` and `uv run` put the tagged build back, so run the venv's
+python directly until then.
